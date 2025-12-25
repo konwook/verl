@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import math
 import os
 import uuid
 from collections import defaultdict
@@ -525,6 +526,65 @@ class RayPPOTrainer:
             gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
         return gen_batch
+
+    def _compute_adaptive_lr_scale(
+        self,
+        reward_tensor: torch.Tensor,
+        reward_extra_infos_dict: dict[str, list],
+        batch: DataProto,
+    ) -> tuple[Optional[float], Optional[float]]:
+        adaptive_lr_mode = OmegaConf.select(self.config, "actor_rollout_ref.actor.adaptive_lr")
+        if adaptive_lr_mode is None:
+            return None, None
+        if adaptive_lr_mode not in {"linear", "sqrt"}:
+            raise ValueError(f"Invalid adaptive_lr mode: {adaptive_lr_mode}")
+
+        pass_rates = None
+        if reward_extra_infos_dict and "acc" in reward_extra_infos_dict:
+            acc_list = reward_extra_infos_dict.get("acc", [])
+            if len(acc_list) == reward_tensor.shape[0]:
+                pass_rates = torch.tensor(acc_list, device=reward_tensor.device, dtype=reward_tensor.dtype)
+
+        if pass_rates is None and "acc" in batch.batch:
+            pass_rates = batch.batch["acc"]
+
+        if pass_rates is None:
+            pass_rates = reward_tensor.sum(dim=-1)
+            if pass_rates.ndim == 0:
+                pass_rates = pass_rates.unsqueeze(0)
+
+        if pass_rates.numel() == 0:
+            return None, None
+
+        zero = torch.isclose(pass_rates, pass_rates.new_zeros(()), rtol=0.0, atol=1e-8)
+        one = torch.isclose(pass_rates, pass_rates.new_ones(()), rtol=0.0, atol=1e-8)
+
+        uids = batch.non_tensor_batch.get("uid")
+        if uids is None:
+            raise ValueError("adaptive_lr requires non_tensor_batch['uid'] for prompt-level aggregation.")
+        if len(uids) != pass_rates.numel():
+            raise ValueError(
+                "adaptive_lr requires uid length to match batch size; "
+                f"got {len(uids)} uids and {pass_rates.numel()} samples."
+            )
+
+        uids_np = np.asarray(uids)
+        if uids_np.size == 0:
+            raise ValueError("adaptive_lr requires non-empty uid list.")
+        uniq, inv = np.unique(uids_np, return_inverse=True)
+        total = np.bincount(inv)
+        zero_np = zero.detach().cpu().numpy().astype(np.int64)
+        one_np = one.detach().cpu().numpy().astype(np.int64)
+        zero_count = np.bincount(inv, weights=zero_np)
+        one_count = np.bincount(inv, weights=one_np)
+        all_zero = zero_count == total
+        all_one = one_count == total
+        non_zero_prompts = np.sum(~(all_zero | all_one))
+        non_zero_rate = non_zero_prompts / len(uniq)
+
+        if adaptive_lr_mode == "sqrt":
+            return math.sqrt(non_zero_rate), non_zero_rate
+        return non_zero_rate, non_zero_rate
 
     def _validate(self):
         data_source_lst = []
@@ -1157,6 +1217,16 @@ class RayPPOTrainer:
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
+                        adaptive_lr_scale, adaptive_lr_non_zero_rate = self._compute_adaptive_lr_scale(
+                            reward_tensor=reward_tensor,
+                            reward_extra_infos_dict=reward_extra_infos_dict,
+                            batch=batch,
+                        )
+                        if adaptive_lr_scale is not None:
+                            batch.meta_info["adaptive_lr_scale"] = adaptive_lr_scale
+                            batch.meta_info["adaptive_lr_non_zero_rate"] = adaptive_lr_non_zero_rate
+                            metrics["actor/adaptive_lr_scale"] = adaptive_lr_scale
+                            metrics["actor/adaptive_lr_non_zero_rate"] = adaptive_lr_non_zero_rate
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})

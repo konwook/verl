@@ -872,6 +872,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
 
+            adaptive_lr_scale = data.meta_info.get("adaptive_lr_scale")
+            adaptive_lr_base_lrs = None
+            if adaptive_lr_scale is not None:
+                adaptive_lr_scale = float(adaptive_lr_scale)
+                adaptive_lr_base_lrs = [group["lr"] for group in self.actor.actor_optimizer.param_groups]
+                for group, base_lr in zip(self.actor.actor_optimizer.param_groups, adaptive_lr_base_lrs):
+                    group["lr"] = base_lr * adaptive_lr_scale
+
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
@@ -884,6 +892,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
             metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+
+            if adaptive_lr_scale is not None:
+                metrics["actor/lr_scaled"] = self.actor.actor_optimizer.param_groups[0]["lr"]
+                for group, base_lr in zip(self.actor.actor_optimizer.param_groups, adaptive_lr_base_lrs):
+                    group["lr"] = base_lr
 
             lr = self.actor_lr_scheduler.get_last_lr()[0]
             metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr

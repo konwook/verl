@@ -81,6 +81,7 @@ class ActorConfig(BaseConfig):
         checkpoint (CheckpointConfig): Configuration for checkpointing.
         optim (OptimizerConfig): Configuration for optimizer.
         use_fused_kernels (bool): Whether to use custom fused kernels (e.g., FlashAttention, fused MLP).
+        adaptive_lr (Optional[str]): Adaptive LR scaling mode: None, "linear", or "sqrt".
     """
 
     _mutable_fields = BaseConfig._mutable_fields | {
@@ -114,6 +115,7 @@ class ActorConfig(BaseConfig):
     shuffle: bool = False
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
+    adaptive_lr: Optional[str] = None
     use_fused_kernels: bool = False
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     engine: BaseConfig = field(default_factory=BaseConfig)
@@ -146,6 +148,9 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+
+        if self.adaptive_lr is not None and self.adaptive_lr not in {"linear", "sqrt"}:
+            raise ValueError(f"Invalid adaptive_lr mode: {self.adaptive_lr}")
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

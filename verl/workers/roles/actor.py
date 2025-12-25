@@ -41,6 +41,22 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def _scale_optimizer_lrs(optimizer, scale):
+    if optimizer is None or scale is None or scale == 1.0:
+        return None
+    original_lrs = [group["lr"] for group in optimizer.param_groups]
+    for group, base_lr in zip(optimizer.param_groups, original_lrs):
+        group["lr"] = base_lr * scale
+    return original_lrs
+
+
+def _restore_optimizer_lrs(optimizer, original_lrs):
+    if optimizer is None or original_lrs is None:
+        return
+    for group, base_lr in zip(optimizer.param_groups, original_lrs):
+        group["lr"] = base_lr
+
+
 class ActorWorker(Worker, DistProfilerExtension):
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
@@ -147,9 +163,14 @@ class ActorWorker(Worker, DistProfilerExtension):
         else:
             data.meta_info["micro_batch_size_per_gpu"] = self.config.ppo_micro_batch_size_per_gpu
 
+        adaptive_lr_scale = data.meta_info.get("adaptive_lr_scale")
+        if adaptive_lr_scale is not None:
+            adaptive_lr_scale = float(adaptive_lr_scale)
+
         metrics = {}
         # Support all hardwares
         data = data.to(get_device_id())
+        adaptive_lr_base_lrs = _scale_optimizer_lrs(self.engine.optimizer, adaptive_lr_scale)
         # perform forward computation
         with self.engine.train_mode():
             dataloader = data.make_iterator(
@@ -177,6 +198,10 @@ class ActorWorker(Worker, DistProfilerExtension):
             metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
+            if adaptive_lr_scale is not None:
+                metrics["actor/lr_scaled"] = self.engine.optimizer.param_groups[0]["lr"]
+
+            _restore_optimizer_lrs(self.engine.optimizer, adaptive_lr_base_lrs)
             lr = self.engine.lr_scheduler_step()
             metrics["actor/lr"] = lr
 

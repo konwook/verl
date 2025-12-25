@@ -635,6 +635,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
+        adaptive_lr_scale = data.meta_info.get("adaptive_lr_scale")
+        adaptive_lr_base_lrs = None
+        if adaptive_lr_scale is not None:
+            adaptive_lr_scale = float(adaptive_lr_scale)
+            adaptive_lr_base_lrs = [group["lr"] for group in self.actor_optimizer.param_groups]
+            for group, base_lr in zip(self.actor_optimizer.param_groups, adaptive_lr_base_lrs):
+                group["lr"] = base_lr * adaptive_lr_scale
         dataloader = self.actor.make_minibatch_iterator(data=data)
         with Timer(name="update_policy", logger=None) as timer:
             metrics = self.actor.update_policy(dataloader=dataloader)
@@ -646,6 +653,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
         metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
         from verl.utils.megatron.optimizer import get_megatron_last_lr
+
+        if adaptive_lr_scale is not None:
+            metrics["actor/lr_scaled"] = self.actor_optimizer.param_groups[0]["lr"]
+            for group, base_lr in zip(self.actor_optimizer.param_groups, adaptive_lr_base_lrs):
+                group["lr"] = base_lr
 
         metrics["actor/lr"] = get_megatron_last_lr(self.actor_optimizer)
         self.actor_optimizer_scheduler.step(1)
