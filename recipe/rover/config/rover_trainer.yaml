@@ -1,0 +1,31 @@
+# the rover config will override default ppo_trainer.yaml
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+actor_rollout_ref:
+
+  actor:
+    _target_: recipe.rover.config.ROVERActorConfig
+
+    rover_rho: 1.0
+
+    rover_q_next_coef: 1.0
+
+    use_kl_loss: false
+
+    entropy_coeff: 0.0
+
+  rollout:
+    n: 4
+
+algorithm:
+
+  adv_estimator: null
+
+  use_kl_in_reward: false
+
+trainer:
+
+  log_val_generations: 0
