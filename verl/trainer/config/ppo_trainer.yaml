@@ -116,6 +116,17 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # Alpha-DPG pseudo-reward configuration
+  alpha_dpg:
+    _target_: verl.trainer.config.AlphaDPGConfig
+    enable: False
+    alpha: 0.9
+    clip_max: 10.0
+    z_estimator: batch
+    z_min: 1e-4
+    z_key: z_estimate
+    scale_by_one_minus_alpha: False
+
 # config for the trainer
 trainer:
 

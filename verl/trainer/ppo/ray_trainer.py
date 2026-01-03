@@ -161,6 +161,116 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
+def _extract_non_tensor_values(data: DataProto, key: str) -> np.ndarray:
+    """Extract per-sample values from DataProto.non_tensor_batch, supporting dotted paths."""
+    if key in data.non_tensor_batch:
+        return np.asarray(data.non_tensor_batch[key])
+
+    parts = key.split(".")
+    values = []
+    for i in range(len(data)):
+        value = data[i].non_tensor_batch
+        for part in parts:
+            if isinstance(value, dict) and part in value:
+                value = value[part]
+            else:
+                raise KeyError(f"alpha_dpg z_key '{key}' not found in non_tensor_batch for sample {i}")
+        values.append(value)
+    return np.asarray(values)
+
+
+def apply_alpha_dpg_reward(
+    data: DataProto, config: AlgoConfig
+) -> tuple[DataProto, dict[str, float]]:
+    """Replace token_level_rewards with alpha-DPG pseudo-rewards."""
+    alpha_cfg = config.alpha_dpg
+    if not alpha_cfg.enable:
+        return data, {}
+
+    if "ref_log_prob" not in data.batch:
+        raise ValueError("alpha_dpg requires ref_log_prob; enable ref policy or set use_kl_loss/use_kl_in_reward.")
+    if "old_log_probs" not in data.batch:
+        raise ValueError("alpha_dpg requires old_log_probs in the batch.")
+
+    if not (0.0 <= alpha_cfg.alpha < 1.0):
+        raise ValueError(f"alpha_dpg.alpha must be in [0, 1). Got {alpha_cfg.alpha}")
+
+    response_mask = data.batch["response_mask"]
+    device = response_mask.device
+    scores = data.batch["token_level_scores"].to(device)
+    response_mask = response_mask.to(device)
+
+    seq_scores = (scores * response_mask).sum(dim=-1)
+    v = torch.clamp(seq_scores, min=0.0)
+
+    z_estimator = str(alpha_cfg.z_estimator).lower()
+    if z_estimator == "batch":
+        uids = data.non_tensor_batch.get("uid")
+        if uids is None:
+            raise ValueError("alpha_dpg z_estimator=batch requires non_tensor_batch['uid'].")
+        uids_np = np.asarray(uids)
+        _, inv = np.unique(uids_np, return_inverse=True)
+        inv_t = torch.from_numpy(inv).to(device)
+        counts = torch.bincount(inv_t).to(v.dtype)
+        sums = torch.bincount(inv_t, weights=v)
+        means = sums / counts.clamp(min=1)
+        z = means[inv_t]
+    elif z_estimator == "data":
+        z_vals = np.asarray(_extract_non_tensor_values(data, alpha_cfg.z_key), dtype=np.float32).reshape(-1)
+        if z_vals.size != v.numel():
+            raise ValueError(
+                f"alpha_dpg z_key '{alpha_cfg.z_key}' length mismatch: "
+                f"{z_vals.size} vs {v.numel()} samples."
+            )
+        z = torch.as_tensor(z_vals, device=device, dtype=v.dtype)
+    else:
+        raise ValueError(f"alpha_dpg z_estimator must be 'batch' or 'data'. Got {alpha_cfg.z_estimator}")
+
+    z = torch.clamp(z, min=alpha_cfg.z_min)
+
+    log_pi = (data.batch["old_log_probs"].to(device) * response_mask).sum(dim=-1)
+    log_pi_ref = (data.batch["ref_log_prob"].to(device) * response_mask).sum(dim=-1)
+
+    v_pos = v > 0
+    log_v = torch.zeros_like(v)
+    log_v[v_pos] = torch.log(v[v_pos])
+
+    log_ratio = log_pi_ref - log_pi - torch.log(z) + log_v
+    pow_factor = 1.0 - float(alpha_cfg.alpha)
+    ratio = torch.zeros_like(v)
+    ratio[v_pos] = torch.exp(log_ratio[v_pos] * pow_factor)
+    pseudo_reward = ratio - 1.0
+
+    clip_max = alpha_cfg.clip_max
+    clip_frac = None
+    if clip_max is not None:
+        clip_mask = pseudo_reward > clip_max
+        clip_frac = clip_mask.float().mean().item()
+        pseudo_reward = torch.clamp(pseudo_reward, max=clip_max)
+
+    if alpha_cfg.scale_by_one_minus_alpha:
+        pseudo_reward = pseudo_reward / max(pow_factor, 1e-8)
+
+    token_level_rewards = torch.zeros_like(scores)
+    response_lengths = response_mask.sum(dim=-1).long()
+    valid = response_lengths > 0
+    token_level_rewards[valid, response_lengths[valid] - 1] = pseudo_reward[valid]
+    data.batch["token_level_rewards"] = token_level_rewards
+
+    metrics = {
+        "alpha_dpg/reward_mean": pseudo_reward.mean().detach().item(),
+        "alpha_dpg/reward_min": pseudo_reward.min().detach().item(),
+        "alpha_dpg/reward_max": pseudo_reward.max().detach().item(),
+        "alpha_dpg/z_mean": z.mean().detach().item(),
+        "alpha_dpg/v_mean": v.mean().detach().item(),
+        "alpha_dpg/v_positive_frac": v_pos.float().mean().detach().item(),
+    }
+    if clip_frac is not None:
+        metrics["alpha_dpg/clip_frac"] = clip_frac
+
+    return data, metrics
+
+
 def compute_response_mask(data: DataProto):
     """Compute the attention mask for the response part of the sequence.
 
@@ -1239,6 +1349,10 @@ class RayPPOTrainer:
                             batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
                             # IS and off-policy metrics already have rollout_corr/ prefix
                             metrics.update(is_metrics)
+
+                        if self.config.algorithm.alpha_dpg.enable:
+                            batch, alpha_metrics = apply_alpha_dpg_reward(batch, self.config.algorithm)
+                            metrics.update(alpha_metrics)
 
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(

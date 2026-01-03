@@ -73,6 +73,16 @@ algorithm:
   pf_ppo:
     reweight_method: pow # ["pow", "max_min", "max_random"]
     weight_pow: 2.0
+  # Alpha-DPG pseudo-reward configuration
+  alpha_dpg:
+    _target_: verl.trainer.config.AlphaDPGConfig
+    enable: False
+    alpha: 0.9
+    clip_max: 10.0
+    z_estimator: batch
+    z_min: 1e-4
+    z_key: z_estimate
+    scale_by_one_minus_alpha: False
 
 trainer:
   balance_batch: True

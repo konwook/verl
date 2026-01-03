@@ -17,7 +17,13 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = [
+    "AlgoConfig",
+    "AlphaDPGConfig",
+    "FilterGroupsConfig",
+    "KLControlConfig",
+    "RolloutCorrectionConfig",
+]
 
 
 @dataclass
@@ -54,6 +60,30 @@ class FilterGroupsConfig(BaseConfig):
     enable: bool = False
     metric: Optional[str] = None
     max_num_gen_batches: int = 0
+
+
+@dataclass
+class AlphaDPGConfig(BaseConfig):
+    """Configuration for alpha-DPG pseudo-reward computation.
+
+    Args:
+        enable (bool): Whether to enable alpha-DPG reward shaping.
+        alpha (float): Alpha-divergence parameter in [0, 1). Lower values are more mass-covering.
+        clip_max (Optional[float]): Upper clip for ((p/pi)^(1-alpha) - 1). None disables clipping.
+        z_estimator (str): How to estimate Z_x. "batch" uses current batch rewards per uid,
+            "data" reads a per-sample estimate from the dataset.
+        z_min (float): Lower bound on Z_x to avoid division by zero.
+        z_key (str): Dataset field name for Z_x when z_estimator="data".
+        scale_by_one_minus_alpha (bool): Whether to multiply by 1/(1-alpha) after clipping.
+    """
+
+    enable: bool = False
+    alpha: float = 0.9
+    clip_max: Optional[float] = 10.0
+    z_estimator: str = "batch"
+    z_min: float = 1e-4
+    z_key: str = "z_estimate"
+    scale_by_one_minus_alpha: bool = False
 
 
 @dataclass
@@ -376,3 +406,4 @@ class AlgoConfig(BaseConfig):
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None
+    alpha_dpg: AlphaDPGConfig = field(default_factory=AlphaDPGConfig)
