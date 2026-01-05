@@ -147,6 +147,95 @@ def get_adv_estimator_fn(name_or_enum):
     return ADV_ESTIMATOR_REGISTRY[name]
 
 
+def _apply_leave_one_out_baseline(values: torch.Tensor, index: np.ndarray) -> torch.Tensor:
+    uids_np = np.asarray(index)
+    _, inv = np.unique(uids_np, return_inverse=True)
+    inv_t = torch.as_tensor(inv, device=values.device)
+    counts = torch.bincount(inv_t).to(values.dtype)
+    sums = torch.bincount(inv_t, weights=values)
+    counts_for = counts[inv_t]
+    sums_for = sums[inv_t]
+    baseline = torch.zeros_like(values)
+    mask = counts_for > 1
+    baseline[mask] = (sums_for[mask] - values[mask]) / (counts_for[mask] - 1)
+    return values - baseline
+
+
+@register_adv_est("fcdpg")
+def compute_fcdpg_advantage(
+    seq_target_scores: torch.Tensor,
+    seq_policy_scores: torch.Tensor,
+    z: torch.Tensor,
+    loss_divergence: str,
+    use_baseline: bool,
+    index: np.ndarray,
+    alpha: Optional[float] = None,
+    center_f: bool = False,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if center_f:
+        print("WARNING: center_f is deprecated")
+
+    dtype = seq_policy_scores.dtype
+    device = seq_policy_scores.device
+
+    norm_seq_target_scores = seq_target_scores - torch.log(z)
+    log_t = seq_policy_scores - norm_seq_target_scores
+
+    loss_divergence = loss_divergence.lower()
+    if loss_divergence == "kl":
+        f_prime = -torch.exp(-log_t)
+    elif loss_divergence == "reverse_kl":
+        f_prime = log_t
+    elif loss_divergence == "js":
+        log_2 = torch.log(torch.tensor(2.0, dtype=dtype, device=device))
+        f_prime = log_2 - torch.nn.functional.softplus(-log_t)
+    elif loss_divergence == "tv":
+        f_prime = torch.sign(log_t) / 2.0
+    elif loss_divergence in ("js_alpha", "alpha_js"):
+        if alpha is None:
+            raise ValueError("Alpha must be provided for js_alpha divergence.")
+        if abs(alpha - 1.0) < 1e-8:
+            f_prime = 1.0 - torch.exp(-log_t)
+        elif abs(alpha) < 1e-8:
+            f_prime = log_t
+        else:
+            f_prime = (1.0 / (1.0 - alpha)) * (-torch.log(alpha + torch.exp(-log_t) * (1 - alpha)))
+    elif loss_divergence == "amari_alpha":
+        if alpha is None:
+            raise ValueError("Alpha must be provided for amari_alpha divergence.")
+        if abs(alpha - 1.0) < 1e-8:
+            f_prime = log_t
+        else:
+            f_prime = 1.0 / (alpha - 1.0) * (torch.exp(log_t * (alpha - 1.0)) - 1.0)
+    elif loss_divergence == "amari_alpha_unit":
+        if alpha is None:
+            raise ValueError("Alpha must be provided for amari_alpha_unit divergence.")
+        if abs(alpha - 1.0) < 1e-8:
+            f_prime = log_t
+        elif abs(alpha) < 1e-8:
+            f_prime = -torch.exp(-log_t)
+        else:
+            f_prime = -(torch.exp(log_t * (alpha - 1.0)) - 1.0)
+    elif loss_divergence == "alpha":
+        if alpha is None:
+            raise ValueError("Alpha must be provided for alpha divergence.")
+        if abs(alpha - 1.0) < 1e-8:
+            f_prime = log_t
+        else:
+            f_prime = (torch.exp(log_t * (alpha - 1.0)) - 1.0) / (alpha - 1.0)
+    else:
+        raise NotImplementedError(f"f-divergence '{loss_divergence}' is not supported.")
+
+    pseudo_reward = -f_prime
+    if use_baseline:
+        advantage = _apply_leave_one_out_baseline(pseudo_reward, index)
+    else:
+        advantage = pseudo_reward
+
+    return advantage.unsqueeze(-1), pseudo_reward.unsqueeze(-1)
+
+
 class AdaptiveKLController:
     """
     Adaptive KL controller described in the paper:

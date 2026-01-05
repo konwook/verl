@@ -271,6 +271,56 @@ def apply_alpha_dpg_reward(
     return data, metrics
 
 
+def _compute_fcdpg_seq_scores(data: DataProto, exponential_ebm: bool, beta: float) -> DataProto:
+    response_mask = data.batch["response_mask"]
+    seq_rewards = (data.batch["token_level_rewards"] * response_mask).sum(dim=-1)
+    seq_ref_scores = (data.batch["ref_log_prob"] * response_mask).sum(dim=-1)
+    seq_old_log_probs = (data.batch["old_log_probs"] * response_mask).sum(dim=-1)
+
+    if "rollout_log_probs" in data.batch:
+        seq_policy_scores = (data.batch["rollout_log_probs"] * response_mask).sum(dim=-1)
+    else:
+        seq_policy_scores = seq_old_log_probs
+
+    if exponential_ebm:
+        seq_target_scores = seq_ref_scores + beta * seq_rewards
+    else:
+        v = torch.clamp(seq_rewards, min=0.0)
+        log_v = torch.zeros_like(v)
+        v_pos = v > 0
+        log_v[v_pos] = torch.log(v[v_pos])
+        seq_target_scores = seq_ref_scores + log_v
+
+    data.batch["seq_target_scores"] = seq_target_scores
+    data.batch["seq_policy_scores"] = seq_policy_scores
+    data.batch["seq_rewards"] = seq_rewards
+    data.batch["seq_ref_scores"] = seq_ref_scores
+    data.batch["seq_old_log_probs"] = seq_old_log_probs
+    return data
+
+
+def _apply_fcdpg_z_from_data(data: DataProto, z_key: str, z_min: float) -> DataProto:
+    z_vals = np.asarray(_extract_non_tensor_values(data, z_key), dtype=np.float32).reshape(-1)
+    if z_vals.size != data.batch["seq_policy_scores"].numel():
+        raise ValueError(
+            f"fcdpg z_key '{z_key}' length mismatch: {z_vals.size} vs {data.batch['seq_policy_scores'].numel()} samples."
+        )
+    device = data.batch["seq_policy_scores"].device
+    z = torch.as_tensor(z_vals, device=device, dtype=data.batch["seq_policy_scores"].dtype)
+    data.batch["z"] = torch.clamp(z, min=z_min)
+    return data
+
+
+def _clip_target_probabilities(data: DataProto, ir_max_clip: float) -> DataProto:
+    seq_target_scores = data.batch["seq_target_scores"]
+    seq_policy_scores = data.batch["seq_policy_scores"]
+    device = seq_target_scores.device
+    dtype = seq_target_scores.dtype
+    clip_val = torch.log(torch.as_tensor(ir_max_clip, device=device, dtype=dtype))
+    data.batch["seq_target_scores"] = (seq_target_scores - seq_policy_scores).min(clip_val) + seq_policy_scores
+    return data
+
+
 def compute_response_mask(data: DataProto):
     """Compute the attention mask for the response part of the sequence.
 
@@ -319,8 +369,23 @@ def compute_advantage(
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
+    adv_name = adv_estimator.value if isinstance(adv_estimator, AdvantageEstimator) else str(adv_estimator)
+    adv_name = adv_name.lower()
     # prepare response group
-    if adv_estimator == AdvantageEstimator.GAE:
+    if adv_name == "fcdpg":
+        advantages, returns = core_algos.compute_fcdpg_advantage(
+            seq_target_scores=data.batch["seq_target_scores"],
+            seq_policy_scores=data.batch["seq_policy_scores"],
+            z=data.batch["z"],
+            loss_divergence=config.fcdpg.loss_divergence,
+            use_baseline=config.fcdpg.use_baseline,
+            index=data.non_tensor_batch["uid"],
+            alpha=config.fcdpg.alpha,
+        )
+        response_length = data.batch["response_mask"].shape[-1]
+        data.batch["advantages"] = advantages.repeat(1, response_length)
+        data.batch["returns"] = returns.repeat(1, response_length)
+    elif adv_estimator == AdvantageEstimator.GAE:
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
         advantages, returns = core_algos.compute_gae_advantage_return(
             token_level_rewards=data.batch["token_level_rewards"],
@@ -1353,6 +1418,21 @@ class RayPPOTrainer:
                         if self.config.algorithm.alpha_dpg.enable:
                             batch, alpha_metrics = apply_alpha_dpg_reward(batch, self.config.algorithm)
                             metrics.update(alpha_metrics)
+
+                        adv_name = str(self.config.algorithm.adv_estimator).lower()
+                        if adv_name == "fcdpg":
+                            batch = _compute_fcdpg_seq_scores(
+                                batch,
+                                exponential_ebm=self.config.algorithm.fcdpg.exponential_ebm,
+                                beta=self.config.algorithm.kl_ctrl.kl_coef,
+                            )
+                            if self.config.algorithm.fcdpg.ir_max_clip:
+                                batch = _clip_target_probabilities(batch, self.config.algorithm.fcdpg.ir_max_clip)
+                            batch = _apply_fcdpg_z_from_data(
+                                batch,
+                                z_key=self.config.algorithm.fcdpg.z_key,
+                                z_min=self.config.algorithm.fcdpg.z_min,
+                            )
 
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(

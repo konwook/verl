@@ -20,6 +20,7 @@ from verl.base_config import BaseConfig
 __all__ = [
     "AlgoConfig",
     "AlphaDPGConfig",
+    "FCDPGConfig",
     "FilterGroupsConfig",
     "KLControlConfig",
     "RolloutCorrectionConfig",
@@ -84,6 +85,29 @@ class AlphaDPGConfig(BaseConfig):
     z_min: float = 1e-4
     z_key: str = "z_estimate"
     scale_by_one_minus_alpha: bool = False
+
+
+@dataclass
+class FCDPGConfig(BaseConfig):
+    """Configuration for f-divergence constrained policy gradient (FCDPG).
+
+    Args:
+        loss_divergence (str): f-divergence name ("alpha", "kl", "reverse_kl", "js", "tv", "js_alpha", "amari_alpha").
+        alpha (Optional[float]): Alpha parameter for skewed divergences.
+        use_baseline (bool): Whether to apply leave-one-out baseline.
+        ir_max_clip (Optional[float]): Max importance ratio cap on target scores.
+        z_key (str): Dataset field name for Z_x when using data-based estimates.
+        z_min (float): Lower bound on Z_x to avoid division by zero.
+        exponential_ebm (bool): Whether to use exp(beta * reward) for target scores.
+    """
+
+    loss_divergence: str = "alpha"
+    alpha: Optional[float] = 0.9
+    use_baseline: bool = True
+    ir_max_clip: Optional[float] = None
+    z_key: str = "reward_model.z_estimate"
+    z_min: float = 1e-4
+    exponential_ebm: bool = False
 
 
 @dataclass
@@ -407,3 +431,4 @@ class AlgoConfig(BaseConfig):
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None
     alpha_dpg: AlphaDPGConfig = field(default_factory=AlphaDPGConfig)
+    fcdpg: FCDPGConfig = field(default_factory=FCDPGConfig)
