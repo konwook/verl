@@ -274,6 +274,7 @@ def apply_alpha_dpg_reward(
 def _compute_fcdpg_seq_scores(data: DataProto, exponential_ebm: bool, beta: float) -> DataProto:
     response_mask = data.batch["response_mask"]
     seq_rewards = (data.batch["token_level_rewards"] * response_mask).sum(dim=-1)
+    assert (seq_rewards == data.batch["token_level_rewards"].sum(dim=-1)).all()
     seq_ref_scores = (data.batch["ref_log_prob"] * response_mask).sum(dim=-1)
     seq_old_log_probs = (data.batch["old_log_probs"] * response_mask).sum(dim=-1)
 
@@ -283,13 +284,10 @@ def _compute_fcdpg_seq_scores(data: DataProto, exponential_ebm: bool, beta: floa
         seq_policy_scores = seq_old_log_probs
 
     if exponential_ebm:
-        seq_target_scores = seq_ref_scores + beta * seq_rewards
+        seq_target_scores = seq_ref_scores + seq_rewards / beta
     else:
-        v = torch.clamp(seq_rewards, min=0.0)
-        log_v = torch.zeros_like(v)
-        v_pos = v > 0
-        log_v[v_pos] = torch.log(v[v_pos])
-        seq_target_scores = seq_ref_scores + log_v
+        eps = torch.finfo(seq_rewards.dtype).tiny
+        seq_target_scores = seq_ref_scores + torch.log(seq_rewards + eps)
 
     data.batch["seq_target_scores"] = seq_target_scores
     data.batch["seq_policy_scores"] = seq_policy_scores
